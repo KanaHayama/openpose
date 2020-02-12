@@ -3,6 +3,7 @@
 
 // OpenPose dependencies
 #include <openpose/headers.hpp>
+#include "opencv2/core/mat.hpp"
 
 namespace op
 {
@@ -43,6 +44,67 @@ namespace op
         CameraIntrinsics,
         Image
     };
+
+	// next frame
+	std::mutex FrameLock;
+	unsigned long long FrameNumber;
+	std::string FrameName;
+	Matrix Frame;
+	// frame buffer
+	std::mutex BufferLock;
+	Matrix Buffer;
+	// input worker producer
+	class UnityPluginUserInput : public WorkerProducer<std::shared_ptr<std::vector<std::shared_ptr<Datum>>>> {
+	private:
+	protected:
+		void initializationOnThread() override {}
+
+		std::shared_ptr<std::vector<std::shared_ptr<Datum>>> workProducer() override {// see datumProducer.hpp & webcamReader.cpp & videoCaptureReader.cpp
+			auto datums = std::make_shared<std::vector<std::shared_ptr<Datum>>>();
+			datums->emplace_back(std::make_shared<Datum>());// TODO: what will happen if we do not add a default Datum if the image is not ready
+			std::unique_lock<std::mutex> lock(FrameLock);
+			if (!Frame.empty()) {
+				Datum& datum = *datums->at(0);
+				std::swap(datum.name, FrameName);
+				datum.frameNumber = FrameNumber;
+				auto& matrix = datum.cvInputData;
+				std::swap(matrix, Frame);
+				datum.cvOutputData = datum.cvInputData;
+			} else {
+				lock.unlock();
+				std::this_thread::sleep_for(std::chrono::microseconds{ 5 });
+			}
+			return datums;
+		}
+	public:
+		// step 1 
+		unsigned char* allocateNewFrameBuffer(const int width, const int height) {
+			try {
+				const std::lock_guard<std::mutex> lock(BufferLock);
+				// each pixel 3 channels byte (BGR)
+				// default stride (number of bytes) is calculated as width * elemSize() = 3 * width
+				// allocate new memory
+				auto frame = cv::Mat(height, width, CV_8UC3);
+				Buffer = OP_CV2OPMAT(frame);
+				return static_cast<cv::Mat*>(Buffer.getCvMat())->data;
+			} catch (const std::exception& e) {
+				errorDestructor(e.what(), __LINE__, __FUNCTION__, __FILE__);
+			}
+		}
+
+		// step 2
+		void postNewFrame() {
+			try {
+				const std::lock_guard<std::mutex> lock(BufferLock);
+				if (!Buffer.empty()) {
+					const std::lock_guard<std::mutex> lock2(FrameLock);
+					std::swap(Frame, Buffer);
+				}
+			} catch (const std::exception& e) {
+				errorDestructor(e.what(), __LINE__, __FUNCTION__, __FILE__);
+			}
+		}
+	};
 
     // This worker will just read and return all the jpg files in a directory
     class UnityPluginUserOutput : public WorkerConsumer<std::shared_ptr<std::vector<std::shared_ptr<Datum>>>>
@@ -400,6 +462,9 @@ namespace op
         }
     };
 
+	// Global user input
+	UnityPluginUserInput*  ptrUserInput = nullptr;
+
     // Global user output
     UnityPluginUserOutput* ptrUserOutput = nullptr;
 
@@ -424,10 +489,16 @@ namespace op
             auto spWrapper = std::make_shared<Wrapper>();
 
             // Initializing the user custom classes
+			auto spUserInput = std::make_shared<UnityPluginUserInput>();
+			ptrUserInput = spUserInput.get();
             auto spUserOutput = std::make_shared<UnityPluginUserOutput>();
             ptrUserOutput = spUserOutput.get();
 
             // Add custom processing
+			if (spWrapperStructInput->producerType == ProducerType::None) {
+				const auto workerInputOnNewThread = true; // TODO: should it be false to increase performance?
+				spWrapper->setWorker(WorkerType::Input, spUserInput, workerInputOnNewThread);
+			}
             const auto workerOutputOnNewThread = true;
             spWrapper->setWorker(WorkerType::Output, spUserOutput, workerOutputOnNewThread);
 
@@ -457,6 +528,23 @@ namespace op
 
     // Functions called from Unity
     extern "C" {
+#ifdef _WIN32
+		OP_API unsigned char* _OPAllocateNewFrameBuffer(int width, int height) {
+			try {
+				return ptrUserInput->allocateNewFrameBuffer(width, height);
+			} catch (const std::exception& e) {
+				errorDestructor(e.what(), __LINE__, __FUNCTION__, __FILE__);
+			}
+		}
+		OP_API void _OPPostNewFrame() {
+			try {
+				ptrUserInput->postNewFrame();
+			} catch (const std::exception& e) {
+				errorDestructor(e.what(), __LINE__, __FUNCTION__, __FILE__);
+			}
+		}
+#endif
+
         // Start openpose safely
         OP_API void _OPRun()
         {
