@@ -60,21 +60,22 @@ namespace op
 		void initializationOnThread() override {}
 
 		std::shared_ptr<std::vector<std::shared_ptr<Datum>>> workProducer() override {// see datumProducer.hpp & webcamReader.cpp & videoCaptureReader.cpp
-			auto datums = std::make_shared<std::vector<std::shared_ptr<Datum>>>();
-			datums->emplace_back(std::make_shared<Datum>());// TODO: what will happen if we do not add a default Datum if the image is not ready
 			std::unique_lock<std::mutex> lock(FrameLock);
 			if (!Frame.empty()) {
+				auto datums = std::make_shared<std::vector<std::shared_ptr<Datum>>>();
+				datums->emplace_back(std::make_shared<Datum>());// TODO: what will happen if we do not add a default Datum if the image is not ready
 				Datum& datum = *datums->at(0);
 				std::swap(datum.name, FrameName);
 				datum.frameNumber = FrameNumber;
 				auto& matrix = datum.cvInputData;
 				std::swap(matrix, Frame);
 				datum.cvOutputData = datum.cvInputData;
+				return datums;
 			} else {
 				lock.unlock();
 				std::this_thread::sleep_for(std::chrono::microseconds{ 5 });
+				return nullptr;
 			}
-			return datums;
 		}
 	public:
 		// step 1 
@@ -567,6 +568,7 @@ namespace op
                 {
                     opLog("Stopping...");
                     ptrUserOutput->stop();
+					ptrUserInput->stop();
                 }
             }
             catch (const std::exception& e)
